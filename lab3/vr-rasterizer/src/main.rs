@@ -1,12 +1,5 @@
-//! Illustrates rendering using Vulkan with multiview. Supports any Vulkan 1.1 capable environment.
-//!
-//! Renders a smooth gradient across the entire view, with different colors per eye.
-//!
-//! This example uses minimal abstraction for clarity. Real-world code should encapsulate and
-//! largely decouple its Vulkan and OpenXR components and handle errors gracefully.
-
 use std::{
-    io::Cursor,
+    num::NonZeroU32,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -14,15 +7,26 @@ use std::{
     time::Duration,
 };
 
-use ash::{
-    util::read_spv,
-    vk::{self, Handle},
-};
+use ash::vk::{self, Handle};
 use openxr as xr;
 
-#[allow(clippy::field_reassign_with_default)] // False positive, might be fixed 1.51
-#[cfg_attr(target_os = "android", ndk_glue::main)]
-pub fn main() {
+use wgpu_hal::{api::Vulkan as HalVulkan, Api};
+
+pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+pub const VIEW_COUNT: u32 = 2;
+const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
+
+/// Maximum number of frames in flight
+const PIPELINE_DEPTH: u32 = 2;
+
+struct Swapchain {
+    handle: xr::Swapchain<xr::Vulkan>,
+    width: u32,
+    height: u32,
+    textures: Vec<wgpu::Texture>,
+}
+
+fn main() {
     // Handle interrupts gracefully
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -32,22 +36,22 @@ pub fn main() {
     .expect("setting Ctrl-C handler");
 
     #[cfg(feature = "static")]
-    let entry = xr::Entry::linked();
+    let xr_entry = xr::Entry::linked();
     #[cfg(not(feature = "static"))]
-    let entry = unsafe {
+    let xr_entry = unsafe {
         xr::Entry::load()
             .expect("couldn't find the OpenXR loader; try enabling the \"static\" feature")
     };
 
     #[cfg(target_os = "android")]
-    entry.initialize_android_loader().unwrap();
+    xr_entry.initialize_android_loader().unwrap();
 
     // OpenXR will fail to initialize if we ask for an extension that OpenXR can't provide! So we
     // need to check all our extensions before initializing OpenXR with them. Note that even if the
     // extension is present, it's still possible you may not be able to use it. For example: the
     // hand tracking extension may be present, but the hand sensor might not be plugged in or turned
     // on. There are often additional checks that should be made before using certain features!
-    let available_extensions = entry.enumerate_extensions().unwrap();
+    let available_extensions = xr_entry.enumerate_extensions().unwrap();
 
     // If a required extension isn't present, you want to ditch out here! It's possible something
     // like your rendering API might not be provided by the active runtime. APIs like OpenGL don't
@@ -61,7 +65,7 @@ pub fn main() {
     {
         enabled_extensions.khr_android_create_instance = true;
     }
-    let xr_instance = entry
+    let xr_instance = xr_entry
         .create_instance(
             &xr::ApplicationInfo {
                 application_name: "openxrs example",
@@ -93,8 +97,8 @@ pub fn main() {
     // OpenXR wants to ensure apps are using the correct graphics card and Vulkan features and
     // extensions, so the instance and device MUST be set up before Instance::create_session.
 
-    let vk_target_version = vk::make_api_version(0, 1, 1, 0); // Vulkan 1.1 guarantees multiview support
-    let vk_target_version_xr = xr::Version::new(1, 1, 0);
+    let vk_target_version = vk::make_api_version(0, 1, 2, 0); // Vulkan 1.2 guarantees multiview support
+    let vk_target_version_xr = xr::Version::new(1, 2, 0);
 
     let reqs = xr_instance
         .graphics_requirements::<xr::Vulkan>(system)
@@ -104,13 +108,13 @@ pub fn main() {
         || vk_target_version_xr.major() > reqs.max_api_version_supported.major()
     {
         panic!(
-            "OpenXR runtime requires Vulkan version > {}, < {}.0.0",
+            "OpenXR runtime requires Vulkan version > {}, < {}.2.0",
             reqs.min_api_version_supported,
             reqs.max_api_version_supported.major() + 1
         );
     }
 
-    unsafe {
+    let (_wgpu_instance, _adapter, device, queue, session, mut frame_wait, mut frame_stream) = unsafe {
         let vk_entry = ash::Entry::load().unwrap();
 
         let vk_app_info = vk::ApplicationInfo::builder()
@@ -118,12 +122,19 @@ pub fn main() {
             .engine_version(0)
             .api_version(vk_target_version);
 
+        type HalInstance = <HalVulkan as Api>::Instance;
+        let flags = wgpu_hal::InstanceFlags::empty();
+        let extensions = HalInstance::required_extensions(&vk_entry, flags).unwrap();
+        let extension_ptrs: Vec<_> = extensions.iter().map(|s| s.as_ptr()).collect();
+
         let vk_instance = {
             let vk_instance = xr_instance
                 .create_vulkan_instance(
                     system,
                     std::mem::transmute(vk_entry.static_fn().get_instance_proc_addr),
-                    &vk::InstanceCreateInfo::builder().application_info(&vk_app_info) as *const _
+                    &vk::InstanceCreateInfo::builder()
+                        .application_info(&vk_app_info)
+                        .enabled_extension_names(&extension_ptrs) as *const _
                         as *const _,
                 )
                 .expect("XR error creating Vulkan instance")
@@ -134,6 +145,18 @@ pub fn main() {
                 vk::Instance::from_raw(vk_instance as _),
             )
         };
+
+        let hal_instance = HalInstance::from_raw(
+            vk_entry.clone(),
+            vk_instance.clone(),
+            vk_target_version,
+            0,
+            extensions,
+            flags,
+            false,
+            Some(Box::new(())),
+        )
+        .unwrap();
 
         let vk_physical_device = vk::PhysicalDevice::from_raw(
             xr_instance
@@ -160,6 +183,15 @@ pub fn main() {
             })
             .expect("Vulkan device has no graphics queue");
 
+        let hal_exposed_adapter = hal_instance.expose_adapter(vk_physical_device).unwrap();
+        println!(
+            "Using adapter {:?}; features: {:?}",
+            hal_exposed_adapter.info, hal_exposed_adapter.features
+        );
+        let enabled_extensions = hal_exposed_adapter
+            .adapter
+            .required_device_extensions(hal_exposed_adapter.features);
+
         let vk_device = {
             let vk_device = xr_instance
                 .create_vulkan_device(
@@ -183,152 +215,10 @@ pub fn main() {
             ash::Device::load(vk_instance.fp_v1_0(), vk::Device::from_raw(vk_device as _))
         };
 
-        let queue = vk_device.get_device_queue(queue_family_index, 0);
-
-        let view_mask = !(!0 << VIEW_COUNT);
-        let render_pass = vk_device
-            .create_render_pass(
-                &vk::RenderPassCreateInfo::builder()
-                    .attachments(&[vk::AttachmentDescription {
-                        format: COLOR_FORMAT,
-                        samples: vk::SampleCountFlags::TYPE_1,
-                        load_op: vk::AttachmentLoadOp::CLEAR,
-                        store_op: vk::AttachmentStoreOp::STORE,
-                        initial_layout: vk::ImageLayout::UNDEFINED,
-                        final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        ..Default::default()
-                    }])
-                    .subpasses(&[vk::SubpassDescription::builder()
-                        .color_attachments(&[vk::AttachmentReference {
-                            attachment: 0,
-                            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        }])
-                        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                        .build()])
-                    .dependencies(&[vk::SubpassDependency {
-                        src_subpass: vk::SUBPASS_EXTERNAL,
-                        dst_subpass: 0,
-                        src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                        dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                        dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                        ..Default::default()
-                    }])
-                    .push_next(
-                        &mut vk::RenderPassMultiviewCreateInfo::builder()
-                            .view_masks(&[view_mask])
-                            .correlation_masks(&[view_mask]),
-                    ),
-                None,
-            )
-            .unwrap();
-
-        let vert = read_spv(&mut Cursor::new(&include_bytes!("fullscreen.vert.spv")[..])).unwrap();
-        let frag = read_spv(&mut Cursor::new(
-            &include_bytes!("debug_pattern.frag.spv")[..],
-        ))
-        .unwrap();
-        let vert = vk_device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&vert), None)
-            .unwrap();
-        let frag = vk_device
-            .create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&frag), None)
-            .unwrap();
-
-        let pipeline_layout = vk_device
-            .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::builder().set_layouts(&[]),
-                None,
-            )
-            .unwrap();
-        let noop_stencil_state = vk::StencilOpState {
-            fail_op: vk::StencilOp::KEEP,
-            pass_op: vk::StencilOp::KEEP,
-            depth_fail_op: vk::StencilOp::KEEP,
-            compare_op: vk::CompareOp::ALWAYS,
-            compare_mask: 0,
-            write_mask: 0,
-            reference: 0,
-        };
-        let pipeline = vk_device
-            .create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::GraphicsPipelineCreateInfo::builder()
-                    .stages(&[
-                        vk::PipelineShaderStageCreateInfo {
-                            stage: vk::ShaderStageFlags::VERTEX,
-                            module: vert,
-                            p_name: b"main\0".as_ptr() as _,
-                            ..Default::default()
-                        },
-                        vk::PipelineShaderStageCreateInfo {
-                            stage: vk::ShaderStageFlags::FRAGMENT,
-                            module: frag,
-                            p_name: b"main\0".as_ptr() as _,
-                            ..Default::default()
-                        },
-                    ])
-                    .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
-                    .input_assembly_state(
-                        &vk::PipelineInputAssemblyStateCreateInfo::builder()
-                            .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
-                    )
-                    .viewport_state(
-                        &vk::PipelineViewportStateCreateInfo::builder()
-                            .scissor_count(1)
-                            .viewport_count(1),
-                    )
-                    .rasterization_state(
-                        &vk::PipelineRasterizationStateCreateInfo::builder()
-                            .cull_mode(vk::CullModeFlags::NONE)
-                            .polygon_mode(vk::PolygonMode::FILL)
-                            .line_width(1.0),
-                    )
-                    .multisample_state(
-                        &vk::PipelineMultisampleStateCreateInfo::builder()
-                            .rasterization_samples(vk::SampleCountFlags::TYPE_1),
-                    )
-                    .depth_stencil_state(
-                        &vk::PipelineDepthStencilStateCreateInfo::builder()
-                            .depth_test_enable(false)
-                            .depth_write_enable(false)
-                            .front(noop_stencil_state)
-                            .back(noop_stencil_state),
-                    )
-                    .color_blend_state(
-                        &vk::PipelineColorBlendStateCreateInfo::builder().attachments(&[
-                            vk::PipelineColorBlendAttachmentState {
-                                blend_enable: vk::TRUE,
-                                src_color_blend_factor: vk::BlendFactor::ONE,
-                                dst_color_blend_factor: vk::BlendFactor::ZERO,
-                                color_blend_op: vk::BlendOp::ADD,
-                                color_write_mask: vk::ColorComponentFlags::R
-                                    | vk::ColorComponentFlags::G
-                                    | vk::ColorComponentFlags::B,
-                                ..Default::default()
-                            },
-                        ]),
-                    )
-                    .dynamic_state(
-                        &vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&[
-                            vk::DynamicState::VIEWPORT,
-                            vk::DynamicState::SCISSOR,
-                        ]),
-                    )
-                    .layout(pipeline_layout)
-                    .render_pass(render_pass)
-                    .subpass(0)
-                    .build()],
-                None,
-            )
-            .unwrap()[0];
-
-        vk_device.destroy_shader_module(vert, None);
-        vk_device.destroy_shader_module(frag, None);
-
         // A session represents this application's desire to display things! This is where we hook
         // up our graphics API. This does not start the session; for that, you'll need a call to
         // Session::begin, which we do in 'main_loop below.
-        let (session, mut frame_wait, mut frame_stream) = xr_instance
+        let (session, frame_wait, frame_stream) = xr_instance
             .create_session::<xr::Vulkan>(
                 system,
                 &xr::vulkan::SessionCreateInfo {
@@ -341,436 +231,418 @@ pub fn main() {
             )
             .unwrap();
 
-        // Create an action set to encapsulate our actions
-        let action_set = xr_instance
-            .create_action_set("input", "input pose information", 0)
-            .unwrap();
+        let limits = hal_exposed_adapter.capabilities.limits.clone();
+        let phd_limits = hal_exposed_adapter
+            .adapter
+            .physical_device_capabilities()
+            .properties()
+            .limits;
+        let uab_types = wgpu_hal::UpdateAfterBindTypes::from_limits(&limits, &phd_limits);
 
-        let right_action = action_set
-            .create_action::<xr::Posef>("right_hand", "Right Hand Controller", &[])
-            .unwrap();
-        let left_action = action_set
-            .create_action::<xr::Posef>("left_hand", "Left Hand Controller", &[])
-            .unwrap();
-
-        // Bind our actions to input devices using the given profile
-        // If you want to access inputs specific to a particular device you may specify a different
-        // interaction profile
-        xr_instance
-            .suggest_interaction_profile_bindings(
-                xr_instance
-                    .string_to_path("/interaction_profiles/khr/simple_controller")
-                    .unwrap(),
-                &[
-                    xr::Binding::new(
-                        &right_action,
-                        xr_instance
-                            .string_to_path("/user/hand/right/input/grip/pose")
-                            .unwrap(),
-                    ),
-                    xr::Binding::new(
-                        &left_action,
-                        xr_instance
-                            .string_to_path("/user/hand/left/input/grip/pose")
-                            .unwrap(),
-                    ),
-                ],
+        let hal_device = hal_exposed_adapter
+            .adapter
+            .device_from_raw(
+                vk_device,
+                true,
+                &enabled_extensions,
+                hal_exposed_adapter.features,
+                uab_types,
+                queue_family_index,
+                0,
             )
             .unwrap();
 
-        // Attach the action set to the session
-        session.attach_action_sets(&[&action_set]).unwrap();
+        let device_desc = wgpu::DeviceDescriptor {
+            label: None,
+            features: hal_exposed_adapter.features,
+            limits,
+        };
 
-        // Create an action space for each device we want to locate
-        let right_space = right_action
-            .create_space(session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
-        let left_space = left_action
-            .create_space(session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
-            .unwrap();
+        let wgpu_instance = wgpu::Instance::from_hal::<HalVulkan>(hal_instance);
+        let wgpu_adapter = wgpu_instance.create_adapter_from_hal(hal_exposed_adapter);
+        let (wgpu_device, wgpu_queue) = wgpu_adapter
+            .create_device_from_hal(hal_device, &device_desc, None)
+            .expect("Failed to create device");
 
-        // OpenXR uses a couple different types of reference frames for positioning content; we need
-        // to choose one for displaying our content! STAGE would be relative to the center of your
-        // guardian system's bounds, and LOCAL would be relative to your device's starting location.
-        let stage = session
-            .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
-            .unwrap();
+        (
+            wgpu_instance,
+            wgpu_adapter,
+            wgpu_device,
+            wgpu_queue,
+            session,
+            frame_wait,
+            frame_stream,
+        )
+    };
 
-        let cmd_pool = vk_device
-            .create_command_pool(
-                &vk::CommandPoolCreateInfo::builder()
-                    .queue_family_index(queue_family_index)
-                    .flags(
-                        vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
-                            | vk::CommandPoolCreateFlags::TRANSIENT,
-                    ),
-                None,
-            )
+    // Load the shaders from disk
+    let vert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::util::make_spirv(include_bytes!("fullscreen.vert.spv")),
+    });
+
+    let frag_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::util::make_spirv(include_bytes!("debug_pattern.frag.spv")),
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[],
+        push_constant_ranges: &[],
+    });
+
+    let swapchain_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: None,
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &vert_shader,
+            entry_point: "main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &frag_shader,
+            entry_point: "main",
+            targets: &[Some(swapchain_format.into())],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: NonZeroU32::new(VIEW_COUNT),
+    });
+
+    // Create an action set to encapsulate our actions
+    let action_set = xr_instance
+        .create_action_set("input", "input pose information", 0)
+        .unwrap();
+
+    let right_action = action_set
+        .create_action::<xr::Posef>("right_hand", "Right Hand Controller", &[])
+        .unwrap();
+    let left_action = action_set
+        .create_action::<xr::Posef>("left_hand", "Left Hand Controller", &[])
+        .unwrap();
+
+    // Bind our actions to input devices using the given profile
+    // If you want to access inputs specific to a particular device you may specify a different
+    // interaction profile
+    xr_instance
+        .suggest_interaction_profile_bindings(
+            xr_instance
+                .string_to_path("/interaction_profiles/khr/simple_controller")
+                .unwrap(),
+            &[
+                xr::Binding::new(
+                    &right_action,
+                    xr_instance
+                        .string_to_path("/user/hand/right/input/grip/pose")
+                        .unwrap(),
+                ),
+                xr::Binding::new(
+                    &left_action,
+                    xr_instance
+                        .string_to_path("/user/hand/left/input/grip/pose")
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+    // Attach the action set to the session
+    session.attach_action_sets(&[&action_set]).unwrap();
+
+    // Create an action space for each device we want to locate
+    let right_space = right_action
+        .create_space(session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+        .unwrap();
+    let left_space = left_action
+        .create_space(session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
+        .unwrap();
+
+    // OpenXR uses a couple different types of reference frames for positioning content; we need
+    // to choose one for displaying our content! STAGE would be relative to the center of your
+    // guardian system's bounds, and LOCAL would be relative to your device's starting location.
+    let stage = session
+        .create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)
+        .unwrap();
+
+    let mut swapchain = {
+        // Now we need to find all the viewpoints we need to take care of! This is a
+        // property of the view configuration type; in this example we use PRIMARY_STEREO,
+        // so we should have 2 viewpoints.
+        //
+        // Because we are using multiview in this example, we require that all view
+        // dimensions are identical.
+        let views = xr_instance
+            .enumerate_view_configuration_views(system, VIEW_TYPE)
             .unwrap();
-        let cmds = vk_device
-            .allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::builder()
-                    .command_pool(cmd_pool)
-                    .command_buffer_count(PIPELINE_DEPTH),
-            )
-            .unwrap();
-        let fences = (0..PIPELINE_DEPTH)
-            .map(|_| {
-                vk_device
-                    .create_fence(
-                        &vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .unwrap()
+        assert_eq!(views.len(), VIEW_COUNT as usize);
+        assert_eq!(views[0], views[1]);
+
+        // Create a swapchain for the viewpoints! A swapchain is a set of texture buffers
+        // used for displaying to screen, typically this is a backbuffer and a front buffer,
+        // one for rendering data to, and one for displaying on-screen.
+
+        let width = views[0].recommended_image_rect_width;
+        let height = views[0].recommended_image_rect_height;
+
+        let handle = session
+            .create_swapchain(&xr::SwapchainCreateInfo {
+                create_flags: xr::SwapchainCreateFlags::EMPTY,
+                usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                    | xr::SwapchainUsageFlags::SAMPLED,
+                format: vk::Format::R8G8B8A8_SRGB.as_raw() as _,
+                // The Vulkan graphics pipeline we create is not set up for multisampling,
+                // so we hardcode this to 1. If we used a proper multisampling setup, we
+                // could set this to `views[0].recommended_swapchain_sample_count`.
+                sample_count: 1,
+                width,
+                height,
+                face_count: 1,
+                array_size: VIEW_COUNT,
+                mip_count: 1,
             })
-            .collect::<Vec<_>>();
+            .unwrap();
 
-        // Main loop
-        let mut swapchain = None;
-        let mut event_storage = xr::EventDataBuffer::new();
-        let mut session_running = false;
-        // Index of the current frame, wrapped by PIPELINE_DEPTH. Not to be confused with the
-        // swapchain image index.
-        let mut frame = 0;
-        'main_loop: loop {
-            if !running.load(Ordering::Relaxed) {
-                println!("requesting exit");
-                // The OpenXR runtime may want to perform a smooth transition between scenes, so we
-                // can't necessarily exit instantly. Instead, we must notify the runtime of our
-                // intent and wait for it to tell us when we're actually done.
-                match session.request_exit() {
-                    Ok(()) => {}
-                    Err(xr::sys::Result::ERROR_SESSION_NOT_RUNNING) => break,
-                    Err(e) => panic!("{}", e),
-                }
+        // We'll want to track our own information about the swapchain, so we can draw stuff
+        // onto it! We'll also create a buffer for each generated texture here as well.
+        let images = handle.enumerate_images().unwrap();
+        let wgpu_texture_desc = wgpu::TextureDescriptor {
+            label: Some("Swapchain Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: VIEW_COUNT,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        };
+        let hal_texture_desc = wgpu_hal::TextureDescriptor {
+            label: wgpu_texture_desc.label,
+            size: wgpu_texture_desc.size,
+            mip_level_count: wgpu_texture_desc.mip_level_count,
+            sample_count: wgpu_texture_desc.sample_count,
+            dimension: wgpu_texture_desc.dimension,
+            format: wgpu_texture_desc.format,
+            usage: wgpu_hal::TextureUses::COLOR_TARGET | wgpu_hal::TextureUses::RESOURCE,
+            memory_flags: wgpu_hal::MemoryFlags::empty(),
+        };
+        Swapchain {
+            handle,
+            width,
+            height,
+            textures: images
+                .into_iter()
+                .map(|color_image| unsafe {
+                    let hal_texture = <HalVulkan as Api>::Device::texture_from_raw(
+                        vk::Image::from_raw(color_image),
+                        &hal_texture_desc,
+                        None,
+                    );
+                    device.create_texture_from_hal::<HalVulkan>(hal_texture, &wgpu_texture_desc)
+                })
+                .collect(),
+        }
+    };
+
+    // Main loop
+    let mut event_storage = xr::EventDataBuffer::new();
+    let mut session_running = false;
+    // Index of the current frame, wrapped by PIPELINE_DEPTH. Not to be confused with the
+    // swapchain image index.
+    let mut frame = 0;
+    'main_loop: loop {
+        if !running.load(Ordering::Relaxed) {
+            println!("requesting exit");
+            // The OpenXR runtime may want to perform a smooth transition between scenes, so we
+            // can't necessarily exit instantly. Instead, we must notify the runtime of our
+            // intent and wait for it to tell us when we're actually done.
+            match session.request_exit() {
+                Ok(()) => {}
+                Err(xr::sys::Result::ERROR_SESSION_NOT_RUNNING) => break,
+                Err(e) => panic!("{}", e),
             }
+        }
 
-            while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
-                use xr::Event::*;
-                match event {
-                    SessionStateChanged(e) => {
-                        // Session state change is where we can begin and end sessions, as well as
-                        // find quit messages!
-                        println!("entered state {:?}", e.state());
-                        match e.state() {
-                            xr::SessionState::READY => {
-                                session.begin(VIEW_TYPE).unwrap();
-                                session_running = true;
-                            }
-                            xr::SessionState::STOPPING => {
-                                session.end().unwrap();
-                                session_running = false;
-                            }
-                            xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
-                                break 'main_loop;
-                            }
-                            _ => {}
+        while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
+            use xr::Event::*;
+            match event {
+                SessionStateChanged(e) => {
+                    // Session state change is where we can begin and end sessions, as well as
+                    // find quit messages!
+                    println!("entered state {:?}", e.state());
+                    match e.state() {
+                        xr::SessionState::READY => {
+                            session.begin(VIEW_TYPE).unwrap();
+                            session_running = true;
                         }
+                        xr::SessionState::STOPPING => {
+                            session.end().unwrap();
+                            session_running = false;
+                        }
+                        xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+                            break 'main_loop;
+                        }
+                        _ => {}
                     }
-                    InstanceLossPending(_) => {
-                        break 'main_loop;
-                    }
-                    EventsLost(e) => {
-                        println!("lost {} events", e.lost_event_count());
-                    }
-                    _ => {}
                 }
-            }
-
-            if !session_running {
-                // Don't grind up the CPU
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-
-            // Block until the previous frame is finished displaying, and is ready for another one.
-            // Also returns a prediction of when the next frame will be displayed, for use with
-            // predicting locations of controllers, viewpoints, etc.
-            let xr_frame_state = frame_wait.wait().unwrap();
-            // Must be called before any rendering is done!
-            frame_stream.begin().unwrap();
-
-            if !xr_frame_state.should_render {
-                frame_stream
-                    .end(
-                        xr_frame_state.predicted_display_time,
-                        environment_blend_mode,
-                        &[],
-                    )
-                    .unwrap();
-                continue;
-            }
-
-            let swapchain = swapchain.get_or_insert_with(|| {
-                // Now we need to find all the viewpoints we need to take care of! This is a
-                // property of the view configuration type; in this example we use PRIMARY_STEREO,
-                // so we should have 2 viewpoints.
-                //
-                // Because we are using multiview in this example, we require that all view
-                // dimensions are identical.
-                let views = xr_instance
-                    .enumerate_view_configuration_views(system, VIEW_TYPE)
-                    .unwrap();
-                assert_eq!(views.len(), VIEW_COUNT as usize);
-                assert_eq!(views[0], views[1]);
-
-                // Create a swapchain for the viewpoints! A swapchain is a set of texture buffers
-                // used for displaying to screen, typically this is a backbuffer and a front buffer,
-                // one for rendering data to, and one for displaying on-screen.
-                let resolution = vk::Extent2D {
-                    width: views[0].recommended_image_rect_width,
-                    height: views[0].recommended_image_rect_height,
-                };
-                let handle = session
-                    .create_swapchain(&xr::SwapchainCreateInfo {
-                        create_flags: xr::SwapchainCreateFlags::EMPTY,
-                        usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
-                            | xr::SwapchainUsageFlags::SAMPLED,
-                        format: COLOR_FORMAT.as_raw() as _,
-                        // The Vulkan graphics pipeline we create is not set up for multisampling,
-                        // so we hardcode this to 1. If we used a proper multisampling setup, we
-                        // could set this to `views[0].recommended_swapchain_sample_count`.
-                        sample_count: 1,
-                        width: resolution.width,
-                        height: resolution.height,
-                        face_count: 1,
-                        array_size: VIEW_COUNT,
-                        mip_count: 1,
-                    })
-                    .unwrap();
-
-                // We'll want to track our own information about the swapchain, so we can draw stuff
-                // onto it! We'll also create a buffer for each generated texture here as well.
-                let images = handle.enumerate_images().unwrap();
-                Swapchain {
-                    handle,
-                    resolution,
-                    buffers: images
-                        .into_iter()
-                        .map(|color_image| {
-                            let color_image = vk::Image::from_raw(color_image);
-                            let color = vk_device
-                                .create_image_view(
-                                    &vk::ImageViewCreateInfo::builder()
-                                        .image(color_image)
-                                        .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
-                                        .format(COLOR_FORMAT)
-                                        .subresource_range(vk::ImageSubresourceRange {
-                                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                                            base_mip_level: 0,
-                                            level_count: 1,
-                                            base_array_layer: 0,
-                                            layer_count: VIEW_COUNT,
-                                        }),
-                                    None,
-                                )
-                                .unwrap();
-                            let framebuffer = vk_device
-                                .create_framebuffer(
-                                    &vk::FramebufferCreateInfo::builder()
-                                        .render_pass(render_pass)
-                                        .width(resolution.width)
-                                        .height(resolution.height)
-                                        .attachments(&[color])
-                                        .layers(1), // Multiview handles addressing multiple layers
-                                    None,
-                                )
-                                .unwrap();
-                            Framebuffer { framebuffer, color }
-                        })
-                        .collect(),
+                InstanceLossPending(_) => {
+                    break 'main_loop;
                 }
-            });
-
-            // We need to ask which swapchain image to use for rendering! Which one will we get?
-            // Who knows! It's up to the runtime to decide.
-            let image_index = swapchain.handle.acquire_image().unwrap();
-
-            // Ensure the last use of this frame's resources is 100% done
-            vk_device
-                .wait_for_fences(&[fences[frame]], true, u64::MAX)
-                .unwrap();
-            vk_device.reset_fences(&[fences[frame]]).unwrap();
-
-            let cmd = cmds[frame];
-            vk_device
-                .begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::builder()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .unwrap();
-            vk_device.cmd_begin_render_pass(
-                cmd,
-                &vk::RenderPassBeginInfo::builder()
-                    .render_pass(render_pass)
-                    .framebuffer(swapchain.buffers[image_index as usize].framebuffer)
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D::default(),
-                        extent: swapchain.resolution,
-                    })
-                    .clear_values(&[vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 1.0],
-                        },
-                    }]),
-                vk::SubpassContents::INLINE,
-            );
-
-            let viewports = [vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: swapchain.resolution.width as f32,
-                height: swapchain.resolution.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }];
-            let scissors = [vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: swapchain.resolution,
-            }];
-            vk_device.cmd_set_viewport(cmd, 0, &viewports);
-            vk_device.cmd_set_scissor(cmd, 0, &scissors);
-
-            // Draw the scene. Multiview means we only need to do this once, and the GPU will
-            // automatically broadcast operations to all views. Shaders can use `gl_ViewIndex` to
-            // e.g. select the correct view matrix.
-            vk_device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            vk_device.cmd_draw(cmd, 3, 1, 0, 0);
-
-            vk_device.cmd_end_render_pass(cmd);
-            vk_device.end_command_buffer(cmd).unwrap();
-
-            session.sync_actions(&[(&action_set).into()]).unwrap();
-
-            // Find where our controllers are located in the Stage space
-            let right_location = right_space
-                .locate(&stage, xr_frame_state.predicted_display_time)
-                .unwrap();
-
-            let left_location = left_space
-                .locate(&stage, xr_frame_state.predicted_display_time)
-                .unwrap();
-
-            let mut printed = false;
-            if left_action.is_active(&session, xr::Path::NULL).unwrap() {
-                print!(
-                    "Left Hand: ({:0<12},{:0<12},{:0<12}), ",
-                    left_location.pose.position.x,
-                    left_location.pose.position.y,
-                    left_location.pose.position.z
-                );
-                printed = true;
+                EventsLost(e) => {
+                    println!("lost {} events", e.lost_event_count());
+                }
+                _ => {}
             }
+        }
 
-            if right_action.is_active(&session, xr::Path::NULL).unwrap() {
-                print!(
-                    "Right Hand: ({:0<12},{:0<12},{:0<12})",
-                    right_location.pose.position.x,
-                    right_location.pose.position.y,
-                    right_location.pose.position.z
-                );
-                printed = true;
-            }
-            if printed {
-                println!();
-            }
+        if !session_running {
+            // Don't grind up the CPU
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
 
-            // Fetch the view transforms. To minimize latency, we intentionally do this *after*
-            // recording commands to render the scene, i.e. at the last possible moment before
-            // rendering begins in earnest on the GPU. Uniforms dependent on this data can be sent
-            // to the GPU just-in-time by writing them to per-frame host-visible memory which the
-            // GPU will only read once the command buffer is submitted.
-            let (_, views) = session
-                .locate_views(VIEW_TYPE, xr_frame_state.predicted_display_time, &stage)
-                .unwrap();
+        // Block until the previous frame is finished displaying, and is ready for another one.
+        // Also returns a prediction of when the next frame will be displayed, for use with
+        // predicting locations of controllers, viewpoints, etc.
+        let xr_frame_state = frame_wait.wait().unwrap();
+        // Must be called before any rendering is done!
+        frame_stream.begin().unwrap();
 
-            // Wait until the image is available to render to before beginning work on the GPU. The
-            // compositor could still be reading from it.
-            swapchain.handle.wait_image(xr::Duration::INFINITE).unwrap();
-
-            // Submit commands to the GPU, then tell OpenXR we're done with our part.
-            vk_device
-                .queue_submit(
-                    queue,
-                    &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()],
-                    fences[frame],
-                )
-                .unwrap();
-            swapchain.handle.release_image().unwrap();
-
-            // Tell OpenXR what to present for this frame
-            let rect = xr::Rect2Di {
-                offset: xr::Offset2Di { x: 0, y: 0 },
-                extent: xr::Extent2Di {
-                    width: swapchain.resolution.width as _,
-                    height: swapchain.resolution.height as _,
-                },
-            };
+        if !xr_frame_state.should_render {
             frame_stream
                 .end(
                     xr_frame_state.predicted_display_time,
                     environment_blend_mode,
-                    &[
-                        &xr::CompositionLayerProjection::new().space(&stage).views(&[
-                            xr::CompositionLayerProjectionView::new()
-                                .pose(views[0].pose)
-                                .fov(views[0].fov)
-                                .sub_image(
-                                    xr::SwapchainSubImage::new()
-                                        .swapchain(&swapchain.handle)
-                                        .image_array_index(0)
-                                        .image_rect(rect),
-                                ),
-                            xr::CompositionLayerProjectionView::new()
-                                .pose(views[1].pose)
-                                .fov(views[1].fov)
-                                .sub_image(
-                                    xr::SwapchainSubImage::new()
-                                        .swapchain(&swapchain.handle)
-                                        .image_array_index(1)
-                                        .image_rect(rect),
-                                ),
-                        ]),
-                    ],
+                    &[],
                 )
                 .unwrap();
-            frame = (frame + 1) % PIPELINE_DEPTH as usize;
+            continue;
         }
 
-        // OpenXR MUST be allowed to clean up before we destroy Vulkan resources it could touch, so
-        // first we must drop all its handles.
-        drop((
-            session,
-            frame_wait,
-            frame_stream,
-            stage,
-            action_set,
-            left_space,
-            right_space,
-            left_action,
-            right_action,
-        ));
+        // We need to ask which swapchain image to use for rendering! Which one will we get?
+        // Who knows! It's up to the runtime to decide.
+        let image_index = swapchain.handle.acquire_image().unwrap();
 
-        // Ensure all in-flight frames are finished before destroying resources they might use
-        vk_device.wait_for_fences(&fences, true, !0).unwrap();
-        for fence in fences {
-            vk_device.destroy_fence(fence, None);
+        // Wait until the image is available to render to. The compositor could still be
+        // reading from it.
+        swapchain.handle.wait_image(xr::Duration::INFINITE).unwrap();
+
+        let view_desc = wgpu::TextureViewDescriptor {
+            base_array_layer: 0,
+            array_layer_count: NonZeroU32::new(VIEW_COUNT),
+            ..Default::default()
+        };
+        let view = swapchain.textures[image_index as usize].create_view(&view_desc);
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
+                        store: true,
+                    },
+                })],
+                depth_stencil_attachment: None,
+            });
+            rpass.set_pipeline(&render_pipeline);
+            rpass.draw(0..3, 0..1);
         }
 
-        if let Some(swapchain) = swapchain {
-            for buffer in swapchain.buffers {
-                vk_device.destroy_framebuffer(buffer.framebuffer, None);
-                vk_device.destroy_image_view(buffer.color, None);
-            }
+        session.sync_actions(&[(&action_set).into()]).unwrap();
+
+        // Find where our controllers are located in the Stage space
+        let right_location = right_space
+            .locate(&stage, xr_frame_state.predicted_display_time)
+            .unwrap();
+
+        let left_location = left_space
+            .locate(&stage, xr_frame_state.predicted_display_time)
+            .unwrap();
+
+        let mut printed = false;
+        if left_action.is_active(&session, xr::Path::NULL).unwrap() {
+            print!(
+                "Left Hand: ({:0<12},{:0<12},{:0<12}), ",
+                left_location.pose.position.x,
+                left_location.pose.position.y,
+                left_location.pose.position.z
+            );
+            printed = true;
         }
 
-        vk_device.destroy_pipeline(pipeline, None);
-        vk_device.destroy_pipeline_layout(pipeline_layout, None);
-        vk_device.destroy_command_pool(cmd_pool, None);
-        vk_device.destroy_render_pass(render_pass, None);
-        vk_device.destroy_device(None);
-        vk_instance.destroy_instance(None);
+        if right_action.is_active(&session, xr::Path::NULL).unwrap() {
+            print!(
+                "Right Hand: ({:0<12},{:0<12},{:0<12})",
+                right_location.pose.position.x,
+                right_location.pose.position.y,
+                right_location.pose.position.z
+            );
+            printed = true;
+        }
+        if printed {
+            println!();
+        }
+
+        // Fetch the view transforms. To minimize latency, we intentionally do this *after*
+        // recording commands to render the scene, i.e. at the last possible moment before
+        // rendering begins in earnest on the GPU. Uniforms dependent on this data can be sent
+        // to the GPU just-in-time by writing them to per-frame host-visible memory which the
+        // GPU will only read once the command buffer is submitted.
+        let (_, views) = session
+            .locate_views(VIEW_TYPE, xr_frame_state.predicted_display_time, &stage)
+            .unwrap();
+
+        // Submit commands to the GPU, then tell OpenXR we're done with our part.
+        queue.submit(Some(encoder.finish()));
+        swapchain.handle.release_image().unwrap();
+
+        // Tell OpenXR what to present for this frame
+        let rect = xr::Rect2Di {
+            offset: xr::Offset2Di { x: 0, y: 0 },
+            extent: xr::Extent2Di {
+                width: swapchain.width as _,
+                height: swapchain.height as _,
+            },
+        };
+        frame_stream
+            .end(
+                xr_frame_state.predicted_display_time,
+                environment_blend_mode,
+                &[
+                    &xr::CompositionLayerProjection::new().space(&stage).views(&[
+                        xr::CompositionLayerProjectionView::new()
+                            .pose(views[0].pose)
+                            .fov(views[0].fov)
+                            .sub_image(
+                                xr::SwapchainSubImage::new()
+                                    .swapchain(&swapchain.handle)
+                                    .image_array_index(0)
+                                    .image_rect(rect),
+                            ),
+                        xr::CompositionLayerProjectionView::new()
+                            .pose(views[1].pose)
+                            .fov(views[1].fov)
+                            .sub_image(
+                                xr::SwapchainSubImage::new()
+                                    .swapchain(&swapchain.handle)
+                                    .image_array_index(1)
+                                    .image_rect(rect),
+                            ),
+                    ]),
+                ],
+            )
+            .unwrap();
+        frame = (frame + 1) % PIPELINE_DEPTH as usize;
     }
 
     println!("exiting cleanly");
@@ -783,21 +655,3 @@ pub fn main() {
         .wait()
         .unwrap();
 }
-
-pub const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
-pub const VIEW_COUNT: u32 = 2;
-const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
-
-struct Swapchain {
-    handle: xr::Swapchain<xr::Vulkan>,
-    buffers: Vec<Framebuffer>,
-    resolution: vk::Extent2D,
-}
-
-struct Framebuffer {
-    framebuffer: vk::Framebuffer,
-    color: vk::ImageView,
-}
-
-/// Maximum number of frames in flight
-const PIPELINE_DEPTH: u32 = 2;

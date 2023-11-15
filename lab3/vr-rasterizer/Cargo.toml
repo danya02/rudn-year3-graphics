@@ -10,3 +10,5 @@ ash = "0.37.3"
 beryllium = "0.13.1"
 ctrlc = "3.4.1"
 openxr = "0.17.1"
+wgpu = { version = "0.14.0", features = ["spirv"] }
+wgpu-hal = "0.14.0"
