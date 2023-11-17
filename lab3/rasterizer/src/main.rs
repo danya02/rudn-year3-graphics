@@ -4,6 +4,7 @@
 use error_iter::ErrorIter as _;
 use log::error;
 use math::{Quat, Vec3};
+use nalgebra::{UnitQuaternion, Vector2};
 use pixels::{Pixels, SurfaceTexture};
 use shapes::get_teapot;
 use std::f64::consts::PI;
@@ -110,8 +111,8 @@ async fn run() {
             location: Vec3::new(0.0, 0.0, 0.5),
             rotation: Quat::identity(),
             projection: world::Projection::Perspective,
-            fov_radians: PI / 5.0,
-            ortho_bounds: (0.0, 0.0, WIDTH as f64, HEIGHT as f64),
+            fov_radians: PI / 6.0,
+            screen_size: Vector2::new(WIDTH as f64, HEIGHT as f64),
         },
         shapes: vec![get_teapot()],
     };
@@ -154,6 +155,25 @@ async fn run() {
                 world.camera.location.z -= 0.1;
             }
 
+            if input.key_held(VirtualKeyCode::H) {
+                world.camera.rotation *= UnitQuaternion::from_euler_angles(0.01, 0.0, 0.0);
+            }
+            if input.key_held(VirtualKeyCode::L) {
+                world.camera.rotation *= UnitQuaternion::from_euler_angles(-0.01, 0.0, 0.0);
+            }
+            if input.key_held(VirtualKeyCode::J) {
+                world.camera.rotation *= UnitQuaternion::from_euler_angles(0.0, 0.01, 0.0);
+            }
+            if input.key_held(VirtualKeyCode::K) {
+                world.camera.rotation *= UnitQuaternion::from_euler_angles(0.0, -0.01, 0.0);
+            }
+            if input.key_held(VirtualKeyCode::I) {
+                world.camera.rotation *= UnitQuaternion::from_euler_angles(0.0, 0.0, 0.01);
+            }
+            if input.key_held(VirtualKeyCode::M) {
+                world.camera.rotation *= UnitQuaternion::from_euler_angles(0.0, 0.0, -0.01);
+            }
+
             // Resize the window
             if let Some(size) = input.window_resized() {
                 if let Err(err) = pixels.resize_surface(size.width, size.height) {
@@ -164,7 +184,7 @@ async fn run() {
             }
 
             // Update internal state and request a redraw
-            world.update();
+            // world.update();
             window.request_redraw();
         }
     });
