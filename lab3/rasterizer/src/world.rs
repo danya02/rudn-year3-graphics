@@ -1,12 +1,21 @@
+use std::convert::Infallible;
+
 use bresenham::Bresenham;
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    geometry::OriginDimensions,
+    pixelcolor::Rgb888,
+    primitives::{Primitive, PrimitiveStyleBuilder},
+    Drawable,
+};
 use nalgebra::{
-    Isometry3, Matrix, Matrix4, OPoint, Perspective3, Point3, Rotation3, Translation3,
-    UnitQuaternion, Vector2, Vector3, Vector4,
+    Isometry3, Matrix, Matrix4, OPoint, Orthographic3, Perspective3, Point3, Rotation3, Scale3,
+    Translation3, UnitQuaternion, Vector2, Vector3, Vector4,
 };
 
 use crate::math::{
     edge_function, is_pixel_overlapping, quat_to_rotmat, sort_points_clockwise,
-    transform_point_by_projection, Pt3, Quat, Vec3,
+    transform_point_by_projection, Mat4, Pt3, Quat, Vec3,
 };
 
 /// Represents the 3D world to draw.
@@ -20,47 +29,30 @@ pub struct Camera {
     pub rotation: Quat,
     pub projection: Projection,
     pub fov_radians: f64,
-    pub screen_size: Vector2<f64>,
 }
 
 impl Camera {
     #[rustfmt::skip]
-    fn world_to_camera_basic(&self, near: f64, far: f64) -> Matrix4<f64> {
-        match self.projection {
-            Projection::Perspective => {
-                let m = self.rotation.to_rotation_matrix().into_inner();
-                let view_matrix = Matrix4::new(
-                    m.m11, m.m12, m.m13, 0.0,
-                    m.m21, m.m22, m.m23, 0.0,
-                    m.m31, m.m32, m.m33, 0.0,
-                    self.location.x, self.location.y, self.location.z, 1.0,
+    fn ortho_raw(&self, l: f64, r: f64, t: f64, b: f64, n: f64, f: f64) -> Matrix4<f64> {
 
-                );
-                let projection_matrix = Perspective3::new(self.screen_size.x / self.screen_size.x, self.fov_radians, near, far);
+        let o = 0.0;
+        // Matrix4::new(
+        //     2.0/(r-l), o, o, o,
+        //     o, 2.0/(t-b), o, o,
+        //     o, o, -2.0/(f-n), o,
+        //     -(r+l)/(r-l), -(t+b)/(t-b), -(f+n)/(f-n), 1.0
+        // )
 
-                projection_matrix.as_matrix() * view_matrix
-            }
-            Projection::Orthographic => {
-                let (t, b, l, r): (f64,f64,f64,f64) = todo!();
-                let (f, n) = (far, near);
-
-                let m = Matrix4::new(
-                        2.0/(r-l), 0.0, 0.0, 0.0,
-                        0.0, 2.0/(t-b), 0.0, 0.0,
-                        (r+l)/(r-l), (t+b)/(t-b), -(f+n)/(f-n), -1.0,
-                        0.0, 0.0, -(2.0*f*n)/(f-n), 1.0
-                    );
-                m
-            }
-        }
+        Orthographic3::new(l,r,b,t,n,f).into()
     }
 
-    pub fn world_to_camera(&self, near: f64, far: f64) -> Matrix4<f64> {
-        let mut m = self.world_to_camera_basic(near, far) * quat_to_rotmat(self.rotation);
-        m[(3, 0)] = self.location[0];
-        m[(3, 1)] = self.location[1];
-        m[(3, 2)] = self.location[2];
-        m
+    fn world_to_camera(&self) -> Mat4 {
+        // Camera is at point X. Camera moves to origin -> point moves to -X
+        (Rotation3::from(self.rotation.inverse()) * Translation3::from(-self.location)).into()
+    }
+
+    fn perspective_raw(&self, aspect: f64, near: f64, far: f64) -> Mat4 {
+        Perspective3::new(aspect, self.fov_radians, near, far).into()
     }
 }
 
@@ -70,163 +62,126 @@ pub enum Projection {
 }
 
 pub struct Shape {
-    pub origin: Vec3,
+    pub origin: Pt3,
     pub rotation: Quat,
-    pub vertices: Vec<Vec3>,
+    pub scale_factor: f64,
+    pub vertices: Vec<Pt3>,
     pub triangles: Vec<(usize, usize, usize)>,
 }
 
+impl Shape {
+    pub fn shape_to_world(&self) -> Mat4 {
+        Mat4::from(Translation3::from(self.origin))
+            * Mat4::from(Rotation3::from(self.rotation))
+            * Mat4::from(Scale3::new(
+                self.scale_factor,
+                self.scale_factor,
+                self.scale_factor,
+            ))
+    }
+}
+
 impl World {
-    pub fn rasterize(&self, frame: &mut [u8], width: u32, height: u32) {
-        for (i, pixel) in frame.chunks_exact_mut(4).enumerate() {
-            let x = (i % width as usize) as usize;
-            let y = (i / width as usize) as usize;
+    pub fn rasterize<D: DrawTarget<Color = Rgb888, Error = Infallible> + OriginDimensions>(
+        &self,
+        frame: &mut D,
+    ) -> Result<(), Infallible> {
+        frame.clear(Rgb888::new(0, 0, 0))?;
 
-            let rgba = { [0, 0, 0, 0xff] };
+        let (mut maxx, mut maxy, mut maxz) =
+            (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let (mut minx, mut miny, mut minz) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        for shape in self.shapes.iter() {
+            let shape_to_world = shape.shape_to_world();
+            for tri in shape.triangles.iter() {
+                for point in [
+                    shape.vertices[tri.0],
+                    shape.vertices[tri.1],
+                    shape.vertices[tri.2],
+                ]
+                .iter()
+                {
+                    let point = shape_to_world.transform_point(&point);
+                    maxx = maxx.max(point.x);
+                    maxy = maxy.max(point.y);
+                    maxz = maxz.max(point.z);
 
-            pixel.copy_from_slice(&rgba);
+                    minx = minx.min(point.x);
+                    miny = miny.min(point.y);
+                    minz = minz.min(point.z);
+                }
+            }
         }
+        let min = Pt3::new(minx, miny, minz);
+        let max = Pt3::new(maxx, maxy, maxz);
+        // let min = w.transform_point(&min);
+        // let max = w.transform_point(&max);
 
-        let mut depth_buffer = vec![vec![f64::INFINITY; width as usize]; height as usize];
+        let (minx, miny, minz) = (min.x, min.y, min.z);
+        let (maxx, maxy, maxz) = (max.x, max.y, max.z);
 
-        let mut set_at = |x: usize, y: usize, color: [u8; 4]| {
-            if !(0..width as usize).contains(&x) {
-                return;
-            }
-            if !(0..height as usize).contains(&y) {
-                return;
-            }
-            frame
-                .chunks_exact_mut(4)
-                .skip(y * width as usize)
-                .skip(x)
-                .next()
-                .unwrap()
-                .copy_from_slice(&color)
-        };
+        let max = [minx.abs(), maxx.abs(), miny.abs(), maxy.abs()]
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let width = frame.size().width;
+        let height = frame.size().height;
+        let fwidth = width as f64;
+        let fheight = height as f64;
 
-        let camera_matrix = self.camera.world_to_camera(0.01, 100.0);
+        let aspect_ratio = fwidth / fheight;
+        let r = max * aspect_ratio;
+        let l = -r;
+        let t = max;
+        let b = -t;
 
-        let camera_location = self.camera.location;
-        let camera_direction = Vec3::x();
-        let camera_direction = self.camera.rotation.transform_vector(&camera_direction);
+        // let camera_to_screen = self.camera.ortho_raw(r, l, t, b, 0.01, 100.0);
+        let camera_to_screen = self.camera.perspective_raw(aspect_ratio, 0.01, 100.0);
 
-        // println!("{camera_matrix:?}");
-
-        let near = 0.01;
-        let far = 100.0;
+        let world_to_camera = self.camera.world_to_camera();
 
         for shape in self.shapes.iter() {
-            let model_matrix =
-                Isometry3::from_parts(Translation3::from(shape.origin), shape.rotation);
-            for (a, b, c) in shape.triangles.iter() {
-                // Transform the triangle according to the shape: first shift them, then rotate the points.
-                let a = shape.vertices[*a];
-                let b = shape.vertices[*b];
-                let c = shape.vertices[*c];
-                let a = Pt3::from(a);
-                let b = Pt3::from(b);
-                let c = Pt3::from(c);
-                let a = model_matrix.transform_point(&a);
-                let b = model_matrix.transform_point(&b);
-                let c = model_matrix.transform_point(&c);
+            let shape_to_world = shape.shape_to_world();
 
-                // Points are now in world space
+            for tri in shape.triangles.iter() {
+                for point in [
+                    shape.vertices[tri.0],
+                    shape.vertices[tri.1],
+                    shape.vertices[tri.2],
+                ]
+                .iter()
+                {
+                    let t = point;
+                    let t = shape_to_world.transform_point(&t);
+                    let t = world_to_camera.transform_point(&t);
+                    let t = camera_to_screen.transform_point(&t);
+                    // if t.x < -aspect_ratio || t.x > aspect_ratio || t.y < -1.0 || t.y > 1.0 {
+                    //     continue;
+                    // }
+                    // println!("{}", t.z);
 
-                // let a = camera_matrix.transform_point(&a);
-                // let b = camera_matrix.transform_point(&b);
-                // let c = camera_matrix.transform_point(&c);
-
-                let a = transform_point_by_projection(a.coords, camera_matrix);
-                let b = transform_point_by_projection(b.coords, camera_matrix);
-                let c = transform_point_by_projection(c.coords, camera_matrix);
-
-                if a.z < near || a.z > far || b.z < near || b.z > far || c.z < near || c.z > far {
-                    continue;
+                    let tx = ((t.x + 1.0) * 0.5 * fwidth) as i32;
+                    let ty = ((-t.y + 1.0) * 0.5 * fwidth) as i32; // in calculation +Y up, but on screen +Y down
+                    let tx = tx.clamp(0, width as i32);
+                    let ty = ty.clamp(0, height as i32);
+                    let t_screen = embedded_graphics::geometry::Point::new(tx, ty);
+                    embedded_graphics::primitives::Rectangle::new(
+                        t_screen,
+                        embedded_graphics::geometry::Size::new(3, 3),
+                    )
+                    .into_styled(
+                        PrimitiveStyleBuilder::new()
+                            .fill_color(if t.z < 0.0 {
+                                Rgb888::new(0, 0, 255)
+                            } else {
+                                Rgb888::new(255, 0, 0)
+                            })
+                            .build(),
+                    )
+                    .draw(frame)?;
                 }
-
-                // Points are now in camera space
-
-                set_at(a.x as usize, a.y as usize, [255, 255, 255, 255]);
-                set_at(b.x as usize, b.y as usize, [255, 255, 255, 255]);
-                set_at(c.x as usize, c.y as usize, [255, 255, 255, 255]);
-
-                // Ensure winding direction
-                let (a, b, c) = sort_points_clockwise((a.into(), b.into(), c.into()));
-
-                // Compute bounding box, clipped inside canvas
-                let x0 = a[0].min(b[0].min(c[0]));
-                let y0 = a[1].min(b[1].min(c[1]));
-                let x1 = a[0].max(b[0].max(c[0]));
-                let y1 = a[1].max(b[1].max(c[1]));
-
-                let x0 = x0 as isize;
-                let y0 = y0 as isize;
-                let x1 = x1 as isize;
-                let y1 = y1 as isize;
-
-                // If the bounding box is entirely contained outside the render area, skip it.
-                if x1 < 0 || x0 > width as isize || y1 < 0 || y0 > height as isize {
-                    continue;
-                }
-
-                let x0 = x0.clamp(0, width as isize - 1);
-                let x1 = x1.clamp(0, width as isize - 1);
-                let y0 = y0.clamp(0, height as isize - 1);
-                let y1 = y1.clamp(0, height as isize - 1);
-
-                // Draw the bounding box
-                // let ba = (x0, y0);
-                // let bb = (x0, y1);
-                // let bc = (x1, y1);
-                // let bd = (x1, y0);
-                // for (x, y) in Bresenham::new(ba, bb)
-                //     .chain(Bresenham::new(bb, bc))
-                //     .chain(Bresenham::new(bc, bd))
-                //     .chain(Bresenham::new(bd, ba))
-                // {
-                //     set_at(x as usize, y as usize, [255, 0, 0, 255]);
-                // }
-
-                // Draw the wireframe.
-                for (x, y) in Bresenham::new(
-                    (a[0] as isize, a[1] as isize),
-                    (b[0] as isize, b[1] as isize),
-                )
-                .chain(Bresenham::new(
-                    (b[0] as isize, b[1] as isize),
-                    (c[0] as isize, c[1] as isize),
-                ))
-                .chain(Bresenham::new(
-                    (c[0] as isize, c[1] as isize),
-                    (a[0] as isize, a[1] as isize),
-                )) {
-                    if x < 0 || x >= width as isize || y < 0 || y >= height as isize {
-                        continue;
-                    }
-
-                    set_at(x as usize, y as usize, [255, 255, 255, 255]);
-                }
-                // // For each pixel in the bounding box, check if it is contained inside the triangle.
-                // for x in x0 as usize..x1 as usize {
-                //     for y in y0 as usize..y1 as usize {
-                //         // Compute barycentric coordinates
-                //         let p = Vec3::new(x as f64, y as f64, 0.0);
-                //         let w0 = edge_function(b, c, p);
-                //         let w1 = edge_function(c, a, p);
-                //         let w2 = edge_function(a, b, p);
-                //         if is_pixel_overlapping((a, b, c), (w0, w1, w2)) {
-                //             // Interpolate Z coordinate
-                //             let z = 1.0 / (1.0 / a[2] * w0 + 1.0 / b[2] * w1 + 1.0 / c[2] * w2);
-                //             if z < depth_buffer[y][x] {
-                //                 depth_buffer[y][x] = z;
-                //                 set_at(x, y, [0, 0, (z * 1000.0) as u8, 255])
-                //             }
-                //         }
-                //     }
-                // }
             }
         }
+        Ok(())
     }
 
     pub fn update(&mut self) {

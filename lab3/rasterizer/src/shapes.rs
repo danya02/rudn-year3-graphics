@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    math::{Quat, Vec3},
+    math::{Pt3, Quat, Vec3},
     world::Shape,
 };
 
@@ -28,7 +28,7 @@ pub fn get_teapot() -> Shape {
                 let x = x.parse().unwrap();
                 let y = y.parse().unwrap();
                 let z = z.parse().unwrap();
-                verts.push(Vec3::new(x, y, z));
+                verts.push(Pt3::new(x, y, z));
                 i
             }
         };
@@ -45,7 +45,7 @@ pub fn get_teapot() -> Shape {
                 let x = x.parse().unwrap();
                 let y = y.parse().unwrap();
                 let z = z.parse().unwrap();
-                verts.push(Vec3::new(x, y, z));
+                verts.push(Pt3::new(x, y, z));
                 i
             }
         };
@@ -63,7 +63,7 @@ pub fn get_teapot() -> Shape {
                 let x = x.parse().unwrap();
                 let y = y.parse().unwrap();
                 let z = z.parse().unwrap();
-                verts.push(Vec3::new(x, y, z));
+                verts.push(Pt3::new(x, y, z));
                 i
             }
         };
@@ -72,9 +72,10 @@ pub fn get_teapot() -> Shape {
     }
 
     Shape {
-        origin: Vec3::zeros(),
+        origin: Pt3::origin(),
         rotation: Quat::identity(),
         vertices: verts,
         triangles: tris,
+        scale_factor: 0.1,
     }
 }

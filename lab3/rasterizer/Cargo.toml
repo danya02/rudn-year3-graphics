@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 bresenham = "0.1.1"
+embedded-graphics = "0.8.1"
 error-iter = "0.4"
 log = "0.4"
 nalgebra = "0.32.3"
