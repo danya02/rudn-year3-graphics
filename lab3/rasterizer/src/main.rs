@@ -6,10 +6,10 @@ use embedded_graphics::geometry::OriginDimensions;
 use embedded_graphics::pixelcolor::raw::ToBytes;
 use error_iter::ErrorIter as _;
 use log::error;
-use math::{Quat, Vec3};
-use nalgebra::{UnitQuaternion, UnitVector3, Vector2};
+use math::{Pt3, Quat, Vec3};
+use nalgebra::UnitQuaternion;
 use pixels::{Pixels, SurfaceTexture};
-use shapes::get_teapot;
+use shapes::{get_suzanne, get_teapot};
 use std::convert::Infallible;
 use std::f64::consts::PI;
 use std::rc::Rc;
@@ -156,18 +156,24 @@ async fn run() {
             .expect("Pixels error")
     };
     let mut world = world::World {
+        world_bbox: None,
         camera: Camera {
             location: Vec3::new(0.0, 0.0, 0.5),
             rotation: Quat::from_euler_angles(0.0, 0.0, 0.0),
+            rotation_angles: Vec3::zeros(),
             projection: world::Projection::Orthographic,
             fov_radians: PI / 6.0,
+            target_height: 2.0,
         },
-        shapes: vec![get_teapot()],
+        shapes: vec![
+            get_teapot().with_location(Pt3::new(0.0, 0.0, 2.0)),
+            get_suzanne().with_location(Pt3::new(3.0, 3.0, 2.0)),
+        ],
     };
 
     pixels.frame_mut().fill(255);
 
-    event_loop.run(move |event, window_target, control_flow| {
+    event_loop.run(move |event, _window_target, control_flow| {
         // Draw the current frame
         if let Event::RedrawRequested(_) = event {
             let mut target = ArrayDrawTarget {
@@ -200,21 +206,25 @@ async fn run() {
             if input.key_held(VirtualKeyCode::A) {
                 // left
                 world.camera.location += world.camera.rotation * Vec3::new(-speed, 0.0, 0.0);
+                world.camera.location.y = world.camera.target_height;
                 *control_flow = ControlFlow::Poll;
             }
             if input.key_held(VirtualKeyCode::D) {
                 // Right
                 world.camera.location += world.camera.rotation * Vec3::new(speed, 0.0, 0.0);
+                world.camera.location.y = world.camera.target_height;
                 *control_flow = ControlFlow::Poll;
             }
             if input.key_held(VirtualKeyCode::W) {
                 // Forward into screen
                 world.camera.location += world.camera.rotation * Vec3::new(0.0, 0.0, -speed);
+                world.camera.location.y = world.camera.target_height;
                 *control_flow = ControlFlow::Poll;
             }
             if input.key_held(VirtualKeyCode::S) {
                 // Back out of screen
                 world.camera.location += world.camera.rotation * Vec3::new(0.0, 0.0, speed);
+                world.camera.location.y = world.camera.target_height;
                 *control_flow = ControlFlow::Poll;
             }
             if input.key_held(VirtualKeyCode::Q) {
@@ -235,8 +245,15 @@ async fn run() {
                 let dy = dy / sensitivity;
                 let dy = dy as f64;
 
-                let rotation = UnitQuaternion::from_euler_angles(dy, dx, 0.0);
-                world.camera.rotation *= rotation;
+                world.camera.rotation_angles += Vec3::new(dy, dx, 0.0);
+                world.camera.rotation = UnitQuaternion::from_euler_angles(
+                    world.camera.rotation_angles.x,
+                    world.camera.rotation_angles.y,
+                    world.camera.rotation_angles.z,
+                );
+
+                // let rotation = UnitQuaternion::from_euler_angles(dy, dx, 0.0);
+                // world.camera.rotation *= rotation;
             }
 
             // Resize the window

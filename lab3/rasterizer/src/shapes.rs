@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Cursor};
+
+use embedded_graphics::{pixelcolor::Rgb888, primitives::PrimitiveStyleBuilder};
 
 use crate::{
-    math::{Pt3, Quat, Vec3},
+    math::{Pt3, Quat},
     world::Shape,
 };
 
@@ -68,7 +70,7 @@ pub fn get_teapot() -> Shape {
             }
         };
 
-        tris.push((a, b, c));
+        tris.push([a, b, c]);
     }
 
     Shape {
@@ -76,6 +78,36 @@ pub fn get_teapot() -> Shape {
         rotation: Quat::identity(),
         vertices: verts,
         triangles: tris,
-        scale_factor: 0.1,
+        scale_factor: 1.0,
+        style: crate::world::RenderingStyle::UnlitRandom,
+        // style: crate::world::RenderingStyle::Wireframe {
+        //     line_style: PrimitiveStyleBuilder::new()
+        //         .stroke_width(2)
+        //         .stroke_color(Rgb888::new(255, 0, 0))
+        //         .build(),
+        // },
+    }
+}
+
+const SUZANNE_DATA: &'static [u8] = include_bytes!("suzanne.stl");
+
+pub fn get_suzanne() -> Shape {
+    let stl = stl_io::read_stl(&mut Cursor::new(SUZANNE_DATA)).unwrap();
+    Shape {
+        origin: Pt3::origin(),
+        rotation: Quat::identity(),
+        scale_factor: 1.0,
+        vertices: stl
+            .vertices
+            .iter()
+            .map(|v| Pt3::new(v[0] as f64, v[1] as f64, v[2] as f64))
+            .collect(),
+        triangles: stl.faces.iter().map(|f| f.vertices).collect(),
+        style: crate::world::RenderingStyle::Wireframe {
+            line_style: PrimitiveStyleBuilder::new()
+                .stroke_width(2)
+                .stroke_color(Rgb888::new(255, 0, 0))
+                .build(),
+        },
     }
 }
