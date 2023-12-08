@@ -4,16 +4,19 @@
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::OriginDimensions;
 use embedded_graphics::pixelcolor::raw::ToBytes;
+use embedded_graphics::primitives::PrimitiveStyleBuilder;
 use error_iter::ErrorIter as _;
 use log::error;
 use math::{Pt3, Quat, Vec3};
 use nalgebra::UnitQuaternion;
 use pixels::{Pixels, SurfaceTexture};
-use shapes::{get_suzanne, get_teapot};
+use shapes::{
+    get_axes, get_cube, get_floor, get_icosahedron, get_suzanne, get_teapot, get_tetrahedron,
+};
 use std::convert::Infallible;
 use std::f64::consts::PI;
 use std::rc::Rc;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, Pixel};
 use winit::event::{Event, VirtualKeyCode};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
@@ -24,12 +27,13 @@ mod math;
 mod shapes;
 mod world;
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+const WIDTH: u32 = 640;
+const HEIGHT: u32 = 480;
 
 struct ArrayDrawTarget<'a> {
     pub array: &'a mut [u8],
     pub width: usize,
+    pub pixels_drawn: usize,
 }
 
 impl<'a> OriginDimensions for ArrayDrawTarget<'a> {
@@ -38,6 +42,21 @@ impl<'a> OriginDimensions for ArrayDrawTarget<'a> {
             self.width as u32,
             ((self.array.len() / 4) / self.width) as u32,
         )
+    }
+}
+
+pub trait PixelCounter {
+    fn get_counter(&self) -> usize;
+    fn reset_counter(&mut self);
+}
+
+impl PixelCounter for ArrayDrawTarget<'_> {
+    fn get_counter(&self) -> usize {
+        self.pixels_drawn
+    }
+
+    fn reset_counter(&mut self) {
+        self.pixels_drawn = 0;
     }
 }
 
@@ -66,6 +85,7 @@ impl<'a> DrawTarget for ArrayDrawTarget<'a> {
 
             let color = &pixel.1.to_be_bytes();
             self.array[idx..idx + 3].copy_from_slice(color);
+            self.pixels_drawn += 1;
         }
 
         Ok(())
@@ -155,6 +175,20 @@ async fn run() {
             .await
             .expect("Pixels error")
     };
+
+    let mut shapes = vec![
+        get_cube().with_location(Pt3::new(-7.0, 2.0, 2.0)),
+        get_tetrahedron().with_location(Pt3::new(-3.0, 2.0, 2.0)),
+        get_icosahedron().with_location(Pt3::new(5.0, 2.0, 2.0)),
+        get_suzanne().with_location(Pt3::new(7.0, 2.0, 2.0)),
+        get_teapot().with_location(Pt3::new(0.0, 0.0, 2.0)),
+    ];
+
+    shapes.extend(get_floor());
+    shapes.extend(get_axes());
+
+    shapes.push(get_cube().with_scale(0.1));
+
     let mut world = world::World {
         world_bbox: None,
         camera: Camera {
@@ -164,12 +198,13 @@ async fn run() {
             projection: world::Projection::Orthographic,
             fov_radians: PI / 6.0,
             target_height: 2.0,
+            light_vector: -Vec3::y_axis(),
+            light_vector_eulers: Vec3::zeros(),
         },
-        shapes: vec![
-            get_teapot().with_location(Pt3::new(0.0, 0.0, 2.0)),
-            get_suzanne().with_location(Pt3::new(3.0, 3.0, 2.0)),
-        ],
+        shapes,
     };
+
+    world.camera.recalculate_light();
 
     pixels.frame_mut().fill(255);
 
@@ -179,6 +214,7 @@ async fn run() {
             let mut target = ArrayDrawTarget {
                 array: pixels.frame_mut(),
                 width: WIDTH as usize,
+                pixels_drawn: 0,
             };
             world.rasterize(&mut target).unwrap();
             if let Err(err) = pixels.render() {
@@ -202,7 +238,7 @@ async fn run() {
             // +Z -- out of screen
 
             //*control_flow = ControlFlow::Wait;
-            let speed = 0.1;
+            let speed = 0.2;
             if input.key_held(VirtualKeyCode::A) {
                 // left
                 world.camera.location += world.camera.rotation * Vec3::new(-speed, 0.0, 0.0);
@@ -227,12 +263,26 @@ async fn run() {
                 world.camera.location.y = world.camera.target_height;
                 *control_flow = ControlFlow::Poll;
             }
-            if input.key_held(VirtualKeyCode::Q) {
-                world.camera.location.z += 0.1;
+
+            if input.key_held(VirtualKeyCode::H) {
+                world.camera.light_vector_eulers.x -= 0.1;
+                world.camera.recalculate_light();
                 *control_flow = ControlFlow::Poll;
             }
-            if input.key_held(VirtualKeyCode::E) {
-                world.camera.location.z -= 0.1;
+            if input.key_held(VirtualKeyCode::L) {
+                world.camera.light_vector_eulers.x += 0.1;
+                world.camera.recalculate_light();
+                *control_flow = ControlFlow::Poll;
+            }
+            if input.key_held(VirtualKeyCode::J) {
+                world.camera.light_vector_eulers.y -= 0.1;
+                world.camera.recalculate_light();
+                *control_flow = ControlFlow::Poll;
+            }
+
+            if input.key_held(VirtualKeyCode::K) {
+                world.camera.light_vector_eulers.y += 0.1;
+                world.camera.recalculate_light();
                 *control_flow = ControlFlow::Poll;
             }
 
@@ -254,6 +304,46 @@ async fn run() {
 
                 // let rotation = UnitQuaternion::from_euler_angles(dy, dx, 0.0);
                 // world.camera.rotation *= rotation;
+            }
+
+            if input.mouse_held(2) {
+                world.camera.fov_radians += f64::to_radians(input.mouse_diff().1 as f64);
+            }
+
+            if input.key_pressed(VirtualKeyCode::P) {
+                world.camera.projection = match world.camera.projection {
+                    world::Projection::Perspective => world::Projection::Orthographic,
+                    world::Projection::Orthographic => world::Projection::Perspective,
+                }
+            }
+
+            if input.key_pressed(VirtualKeyCode::C) {
+                for object in world.shapes.iter_mut() {
+                    object.style = match object.style {
+                        world::RenderingStyle::Wireframe { line_style } => {
+                            world::RenderingStyle::Unlit {
+                                color: line_style.stroke_color.unwrap_or_default(),
+                                line_color: None,
+                            }
+                        }
+                        world::RenderingStyle::UnlitRandom => world::RenderingStyle::UnlitRandom,
+                        world::RenderingStyle::Unlit { color, line_color } => {
+                            world::RenderingStyle::ViewLight { color, line_color }
+                        }
+                        world::RenderingStyle::ViewLight { color, line_color } => {
+                            world::RenderingStyle::GlobalLight { color, line_color }
+                        }
+                        world::RenderingStyle::GlobalLight {
+                            color,
+                            line_color: _,
+                        } => world::RenderingStyle::Wireframe {
+                            line_style: PrimitiveStyleBuilder::new()
+                                .stroke_color(color)
+                                .stroke_width(2)
+                                .build(),
+                        },
+                    };
+                }
             }
 
             // Resize the window
