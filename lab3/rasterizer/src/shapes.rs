@@ -128,7 +128,7 @@ pub fn get_cube() -> Shape {
             .collect(),
         triangles: stl.faces.iter().map(|f| f.vertices).collect(),
         style: crate::world::RenderingStyle::GlobalLight {
-            color: Rgb888::new(255, 0, 0),
+            color: Rgb888::new(255, 0, 255),
             line_color: None,
         },
     }
@@ -149,7 +149,7 @@ pub fn get_tetrahedron() -> Shape {
             .collect(),
         triangles: stl.faces.iter().map(|f| f.vertices).collect(),
         style: crate::world::RenderingStyle::GlobalLight {
-            color: Rgb888::new(255, 0, 0),
+            color: Rgb888::new(0, 255, 0),
             line_color: None,
         },
     }
@@ -170,7 +170,7 @@ pub fn get_icosahedron() -> Shape {
             .collect(),
         triangles: stl.faces.iter().map(|f| f.vertices).collect(),
         style: crate::world::RenderingStyle::GlobalLight {
-            color: Rgb888::new(255, 0, 0),
+            color: Rgb888::new(255, 255, 0),
             line_color: None,
         },
     }
